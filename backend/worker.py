@@ -3,7 +3,12 @@
 import os
 import time
 
-from db import connect_sync, ensure_schema_sync, seed_if_empty_sync
+from db import (
+    connect_sync,
+    ensure_schema_sync,
+    seed_calibrations_if_empty_sync,
+    seed_if_empty_sync,
+)
 from rules import judge_microstrain
 
 POLL_SECONDS = float(os.environ.get("WORKER_POLL_SECONDS", "1.0"))
@@ -63,6 +68,7 @@ def main() -> None:
     with connect_sync() as conn:
         ensure_schema_sync(conn)
         seed_if_empty_sync(conn)
+        seed_calibrations_if_empty_sync(conn)
         conn.commit()
 
     while True:

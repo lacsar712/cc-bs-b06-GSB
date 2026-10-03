@@ -1,12 +1,23 @@
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import jwt
 from passlib.context import CryptContext
 from sanic import Sanic
 from sanic.response import json as sanic_json
 
-from db import create_pool, ensure_schema, seed_if_empty
+from db import (
+    create_pool,
+    ensure_schema,
+    seed_calibrations_if_empty,
+    seed_if_empty,
+)
+from rules import (
+    BLOCK_REASON_UNREGISTERED,
+    CALIBRATION_EXPIRED_SQL,
+    block_reason_expired,
+    calibration_status,
+)
 
 SECRET = os.environ.get("JWT_SECRET", "bridge-strain-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -52,12 +63,24 @@ def _iso(dt) -> str | None:
     return dt.isoformat()
 
 
+def _calibration_json(r: dict) -> dict:
+    return {
+        "gauge_code": r["gauge_code"],
+        "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
+        "expired": r["expired"],
+        "status": calibration_status(r["expired"]),
+        "updated_by": r["updated_by"],
+        "updated_at": _iso(r["updated_at"]),
+    }
+
+
 @app.before_server_start
 async def setup(_app, _loop):
     pool = await create_pool()
     _app.ctx.pool = pool
     await ensure_schema(pool)
     await seed_if_empty(pool)
+    await seed_calibrations_if_empty(pool)
 
 
 @app.after_server_stop
@@ -100,7 +123,7 @@ async def list_readings(request):
         async with conn.cursor() as cur:
             await cur.execute(
                 """
-                SELECT id, span_code, microstrain, verdict, reason, status,
+                SELECT id, span_code, gauge_code, microstrain, verdict, reason, status,
                        created_by, created_at, processed_at
                 FROM strain_readings
                 ORDER BY id DESC
@@ -113,6 +136,7 @@ async def list_readings(request):
             {
                 "id": r["id"],
                 "span_code": r["span_code"],
+                "gauge_code": r["gauge_code"],
                 "microstrain": r["microstrain"],
                 "verdict": r["verdict"],
                 "reason": r["reason"],
@@ -134,8 +158,11 @@ async def create_reading(request):
         return sanic_json({"detail": "仅测量员可提交应变读数"}, status=403)
     body = request.json or {}
     span_code = str(body.get("span_code", "")).strip()
+    gauge_code = str(body.get("gauge_code", "")).strip()
     if not span_code:
         return sanic_json({"detail": "跨段编号不能为空"}, status=400)
+    if not gauge_code:
+        return sanic_json({"detail": "应变片片号不能为空"}, status=400)
     try:
         microstrain = float(body.get("microstrain"))
     except (TypeError, ValueError):
@@ -144,14 +171,72 @@ async def create_reading(request):
     pool = request.app.ctx.pool
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
+            # 片号级事务锁：与续期/改期写口串行化。两者几乎同时撞上时，
+            # 锁只放行一方先完成，另一方随后读到已提交的新到期日，
+            # 因此一次撞单只会有一种结局，不会出现判了一半的中间态。
+            await cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", (gauge_code,)
+            )
+            # 放行判定与专页列表共用同一句 SQL（rules.CALIBRATION_EXPIRED_SQL）
+            await cur.execute(
+                f"""
+                SELECT expires_at, {CALIBRATION_EXPIRED_SQL} AS expired
+                FROM gauge_calibrations
+                WHERE gauge_code = %s
+                FOR UPDATE
+                """,
+                (gauge_code,),
+            )
+            cal = await cur.fetchone()
+            if cal is None:
+                await cur.execute(
+                    """
+                    INSERT INTO calibration_blocks
+                        (gauge_code, span_code, microstrain, reason, expires_at, attempted_by)
+                    VALUES (%s, %s, %s, %s, NULL, %s)
+                    """,
+                    (
+                        gauge_code,
+                        span_code,
+                        microstrain,
+                        BLOCK_REASON_UNREGISTERED,
+                        user["username"],
+                    ),
+                )
+                await conn.commit()
+                return sanic_json(
+                    {"detail": BLOCK_REASON_UNREGISTERED, "code": "gauge_unregistered"},
+                    status=409,
+                )
+            if cal["expired"]:
+                reason = block_reason_expired(gauge_code, cal["expires_at"])
+                await cur.execute(
+                    """
+                    INSERT INTO calibration_blocks
+                        (gauge_code, span_code, microstrain, reason, expires_at, attempted_by)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        gauge_code,
+                        span_code,
+                        microstrain,
+                        reason,
+                        cal["expires_at"],
+                        user["username"],
+                    ),
+                )
+                await conn.commit()
+                return sanic_json(
+                    {"detail": reason, "code": "calibration_expired"}, status=409
+                )
             await cur.execute(
                 """
-                INSERT INTO strain_readings (span_code, microstrain, status, created_by, created_at)
-                VALUES (%s, %s, 'pending', %s, now())
-                RETURNING id, span_code, microstrain, verdict, reason, status,
+                INSERT INTO strain_readings (span_code, gauge_code, microstrain, status, created_by, created_at)
+                VALUES (%s, %s, %s, 'pending', %s, now())
+                RETURNING id, span_code, gauge_code, microstrain, verdict, reason, status,
                           created_by, created_at, processed_at
                 """,
-                (span_code, microstrain, user["username"]),
+                (span_code, gauge_code, microstrain, user["username"]),
             )
             row = await cur.fetchone()
         await conn.commit()
@@ -160,6 +245,7 @@ async def create_reading(request):
         {
             "id": row["id"],
             "span_code": row["span_code"],
+            "gauge_code": row["gauge_code"],
             "microstrain": row["microstrain"],
             "verdict": row["verdict"],
             "reason": row["reason"],
@@ -171,3 +257,101 @@ async def create_reading(request):
         },
         status=201,
     )
+
+
+@app.get("/api/calibrations")
+async def list_calibrations(request):
+    if not _require_user(request):
+        return sanic_json({"detail": "未登录"}, status=401)
+    pool = request.app.ctx.pool
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            # 专页状态列与报送写口共用同一句 SQL（rules.CALIBRATION_EXPIRED_SQL）
+            await cur.execute(
+                f"""
+                SELECT gauge_code, expires_at, {CALIBRATION_EXPIRED_SQL} AS expired,
+                       updated_by, updated_at
+                FROM gauge_calibrations
+                ORDER BY gauge_code
+                """
+            )
+            rows = await cur.fetchall()
+    return sanic_json([_calibration_json(r) for r in rows])
+
+
+@app.put("/api/calibrations/<gauge_code>", unquote=True)
+async def upsert_calibration(request, gauge_code):
+    user = _require_user(request)
+    if not user:
+        return sanic_json({"detail": "未登录"}, status=401)
+    if user["role"] != "writer":
+        return sanic_json(
+            {"detail": "观察岗只读：仅测量员可维护校准到期日"}, status=403
+        )
+    gauge_code = gauge_code.strip()
+    if not gauge_code:
+        return sanic_json({"detail": "片号不能为空"}, status=400)
+    body = request.json or {}
+    raw = str(body.get("expires_at", "")).strip()
+    try:
+        expires_on = date.fromisoformat(raw)
+    except ValueError:
+        return sanic_json({"detail": "到期日格式应为 YYYY-MM-DD"}, status=400)
+
+    pool = request.app.ctx.pool
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            # 与报送写口同一把片号级事务锁：续期与报送撞单只许一种结局
+            await cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))", (gauge_code,)
+            )
+            await cur.execute(
+                f"""
+                INSERT INTO gauge_calibrations (gauge_code, expires_at, updated_by, updated_at)
+                VALUES (%s, %s, %s, now())
+                ON CONFLICT (gauge_code) DO UPDATE
+                SET expires_at = EXCLUDED.expires_at,
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = now()
+                RETURNING gauge_code, expires_at, {CALIBRATION_EXPIRED_SQL} AS expired,
+                          updated_by, updated_at
+                """,
+                (gauge_code, expires_on, user["username"]),
+            )
+            row = await cur.fetchone()
+        await conn.commit()
+    return sanic_json(_calibration_json(row))
+
+
+@app.get("/api/blocks")
+async def list_blocks(request):
+    if not _require_user(request):
+        return sanic_json({"detail": "未登录"}, status=401)
+    pool = request.app.ctx.pool
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, gauge_code, span_code, microstrain, reason, expires_at,
+                       attempted_by, created_at
+                FROM calibration_blocks
+                ORDER BY id DESC
+                LIMIT 200
+                """
+            )
+            rows = await cur.fetchall()
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "id": r["id"],
+                "gauge_code": r["gauge_code"],
+                "span_code": r["span_code"],
+                "microstrain": r["microstrain"],
+                "reason": r["reason"],
+                "expires_at": r["expires_at"].isoformat() if r["expires_at"] else None,
+                "attempted_by": r["attempted_by"],
+                "created_at": _iso(r["created_at"]),
+            }
+        )
+    return sanic_json(out)
