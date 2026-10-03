@@ -129,3 +129,11 @@ th {
   background: #fff8e1;
   color: #f57f17;
 }
+
+tr.row-expired {
+  background: #fff5f5;
+}
+
+tr.row-expired td {
+  border-color: #f3c4c4;
+}
